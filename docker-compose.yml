@@ -1,0 +1,122 @@
+# Backup Pi-hole (replica) on a Mac, kept in sync with the primary Pi-hole on
+# a Raspberry Pi by nebula-sync. Like the Pi, it resolves through its own
+# unbound (recursive, no third-party DNS provider).
+#
+# Secrets, addresses and the time zone come from ./.env (chmod 600, not
+# committed). See .env.example.
+
+name: pihole   # fixed project name, so renaming the folder doesn't orphan the containers
+
+# Fixed subnet, so unbound can have a fixed IP: Pi-hole's upstreams must be IPs.
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.30.53.0/24
+
+services:
+  pihole:
+    # Core v6.5, Web v6.6.1, FTL v6.8: what `pihole -up` brings the Pi to.
+    # Keep the Pi and this tag on the same versions (update the Mac first).
+    image: pihole/pihole:2026.10.1
+    container_name: pihole
+    hostname: pihole-mac
+    # Port mapping instead of network_mode: host. On OrbStack, both modes relay
+    # traffic through a userspace proxy, so neither shows real client IPs (tested).
+    # Mapping lets us bind DNS to one LAN IP only: if the host has a second
+    # interface on the same subnet (Ethernet + Wi-Fi), a specific bind guarantees
+    # UDP replies come from the address the client queried.
+    ports:
+      - "${REPLICA_IP:?set REPLICA_IP in .env}:53:53/tcp"
+      - "${REPLICA_IP}:53:53/udp"
+      - "${REPLICA_WEB_PORT:-8081}:80/tcp"   # web UI: http://<REPLICA_IP>:<REPLICA_WEB_PORT>/admin
+    environment:
+      TZ: ${TZ:-Etc/UTC}
+      FTLCONF_webserver_api_password: ${PIHOLE_WEB_PASSWORD:?set PIHOLE_WEB_PASSWORD in .env}
+      # Mac-specific settings. FTLCONF_* values are enforced at every start and are
+      # also excluded from nebula-sync below, so the Pi's values never replace them.
+      FTLCONF_dns_listeningMode: ALL
+      # All LAN clients appear as one client (the Docker gateway), so the default
+      # per-client rate limit (1000 queries/60 s) would throttle the whole LAN
+      # during a failover. Disable it here.
+      FTLCONF_dns_rateLimit_count: "0"
+      # The unbound container below. (The Pi uses its local unbound, 127.0.0.1#5335.)
+      FTLCONF_dns_upstreams: "172.30.53.53#53"
+    volumes:
+      - ./etc-pihole:/etc/pihole
+    restart: unless-stopped
+
+  # Recursive resolver for the Mac's Pi-hole, as unbound is for the Pi's.
+  # A separate container with a fixed IP rather than sharing pihole's network:
+  # if pihole restarted on its own, a container in its network namespace would
+  # be left without network. Not published: only reachable inside this project.
+  unbound:
+    # Upgrade by changing the tag.
+    image: klutchell/unbound:1.26.2
+    container_name: unbound
+    volumes:
+      - ./unbound/pihole.conf:/etc/unbound/custom.conf.d/pihole.conf:ro
+    networks:
+      default:
+        ipv4_address: 172.30.53.53
+    restart: unless-stopped
+
+  nebula-sync:
+    image: ghcr.io/lovelaze/nebula-sync:v0.11.3
+    container_name: nebula-sync
+    depends_on:
+      - pihole
+    environment:
+      TZ: ${TZ:-Etc/UTC}
+      # Primary = the Pi (read only). Replica = this container, via the compose network.
+      PRIMARY: "http://${PI_IP:?set PI_IP in .env}|${PI_PRIMARY_PASSWORD:?set PI_PRIMARY_PASSWORD in .env}"
+      REPLICAS: "http://pihole|${PIHOLE_WEB_PASSWORD}"
+      CRON: "0 * * * *"          # hourly
+      RUN_GRAVITY: "true"        # rebuild the blocklist DB after syncing adlists
+      # Selective sync. Never FULL_SYNC: a Teleporter import would overwrite
+      # Mac-specific settings.
+      FULL_SYNC: "false"
+      # Blocklists, allow/deny lists, groups and clients
+      SYNC_GRAVITY_GROUP: "true"
+      SYNC_GRAVITY_AD_LIST: "true"
+      SYNC_GRAVITY_AD_LIST_BY_GROUP: "true"
+      SYNC_GRAVITY_DOMAIN_LIST: "true"
+      SYNC_GRAVITY_DOMAIN_LIST_BY_GROUP: "true"
+      SYNC_GRAVITY_CLIENT: "true"
+      SYNC_GRAVITY_CLIENT_BY_GROUP: "true"
+      SYNC_GRAVITY_DHCP_LEASES: "false"
+      # DNS config: includes local DNS records (hosts, cnameRecords) and upstreams.
+      # Excluded: settings that must differ on the Mac. upstreams: the Pi's
+      # 127.0.0.1#5335 (its local unbound) doesn't exist here.
+      SYNC_CONFIG_DNS: "true"
+      SYNC_CONFIG_DNS_EXCLUDE: "interface,listeningMode,port,rateLimit.count,rateLimit.interval,upstreams"
+      # Never DHCP: two DHCP servers on one LAN would break the network.
+      SYNC_CONFIG_DHCP: "false"
+      SYNC_CONFIG_NTP: "false"
+      SYNC_CONFIG_RESOLVER: "false"
+      SYNC_CONFIG_DATABASE: "false"
+      SYNC_CONFIG_MISC: "false"
+      SYNC_CONFIG_DEBUG: "false"
+    restart: unless-stopped
+
+  # Push alerts via ntfy when the Pi's or this Mac's Pi-hole stops answering,
+  # and again when it recovers. Logic and checks: monitor/pi-monitor.sh.
+  # No depends_on: it must keep running (and alerting) even if pihole fails.
+  pi-monitor:
+    image: alpine:3.20
+    container_name: pi-monitor
+    init: true   # so `docker compose stop` doesn't wait 10 s for the sleep loop
+    command: ["sh", "/monitor/pi-monitor.sh"]
+    environment:
+      # The same time zone as a POSIX rule: the alpine image has no tzdata.
+      TZ: ${TZ_POSIX:-UTC0}
+      NTFY_TOPIC: ${NTFY_TOPIC:?set NTFY_TOPIC in .env}
+      PI_URL: http://${PI_IP}
+      PI_DNS: ${PI_IP}
+      MAC_URL: http://pihole   # this Mac's Pi-hole, via the compose network
+      MAC_DNS: pihole
+      INTERVAL: "60"           # seconds between checks
+      FAILS_BEFORE_ALERT: "3"  # so about 3 minutes of failure before a push
+    volumes:
+      - ./monitor:/monitor:ro
+    restart: unless-stopped

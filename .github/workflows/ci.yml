@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint and validate configs
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck
+        run: shellcheck scripts/*.sh monitor/*.sh
+
+      - name: docker compose config
+        run: cp .env.example .env && docker compose config -q
+
+      - name: Example export is valid
+        run: jq -e '.dns and .groups and .lists and .domains and .clients' examples/config-export.example.json
+
+      - name: unbound-checkconf (replica, klutchell/unbound + unbound/pihole.conf)
+        run: |
+          image=$(docker compose --env-file .env.example config --images | grep unbound)
+          docker run --rm --entrypoint unbound-checkconf \
+            -v "$PWD/unbound/pihole.conf:/etc/unbound/custom.conf.d/pihole.conf:ro" "$image"
+
+      - name: unbound-checkconf (primary, Debian's unbound + pi/unbound/pi-hole.conf)
+        run: |
+          docker run --rm -v "$PWD/pi/unbound/pi-hole.conf:/etc/unbound/unbound.conf.d/pi-hole.conf:ro" \
+            debian:trixie-slim sh -euc '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq && apt-get install -y -qq unbound >/dev/null
+              mkdir -p /var/log/unbound
+              # What the systemd unit runs before starting unbound on a real Pi.
+              /usr/libexec/unbound-helper root_trust_anchor_update
+              unbound-checkconf'
+
+  smoke:
+    name: Replica smoke test and config round trip
+    runs-on: ubuntu-24.04
+    needs: lint
+    env:
+      TARGET: http://127.0.0.1:8090
+      TARGET_PASSWORD: ci-password
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare .env and local/
+        run: |
+          cp .env.example .env
+          # The replica's DNS on localhost; a throwaway Pi-hole on :8090 plays the primary.
+          sed -i -e "s/^REPLICA_IP=.*/REPLICA_IP='127.0.0.1'/" \
+                 -e "s/^PI_IP=.*/PI_IP='127.0.0.1:8090'/" \
+                 -e "s/^PI_PRIMARY_PASSWORD=.*/PI_PRIMARY_PASSWORD='ci-password'/" \
+                 -e "s/^PIHOLE_WEB_PASSWORD=.*/PIHOLE_WEB_PASSWORD='ci-password'/" .env
+          mkdir -p local/pi
+
+      - name: Start the replica's Pi-hole and unbound
+        run: docker compose up -d pihole unbound
+
+      - name: Start a throwaway Pi-hole as the primary
+        run: |
+          image=$(docker compose config --images | grep pihole/pihole)
+          docker run -d --name primary -p 127.0.0.1:8090:80 \
+            -e FTLCONF_webserver_api_password="$TARGET_PASSWORD" "$image"
+
+      - name: Replica resolves recursively through unbound
+        run: |
+          for _ in $(seq 60); do dig +short +time=2 @127.0.0.1 example.com | grep -q . && break; sleep 5; done
+          dig +short +time=5 @127.0.0.1 example.com | grep -q .
+
+      - name: Replica validates DNSSEC
+        run: |
+          dig +time=5 @127.0.0.1 dnssec-failed.org | grep -q 'status: SERVFAIL'
+
+      - name: Replica blocks (default list, after its first gravity run)
+        run: |
+          for _ in $(seq 60); do dig +short +time=2 @127.0.0.1 doubleclick.net | grep -qx 0.0.0.0 && break; sleep 5; done
+          dig +short +time=5 @127.0.0.1 doubleclick.net | grep -qx 0.0.0.0
+
+      - name: Apply the example export to the primary
+        run: |
+          for _ in $(seq 30); do curl -fs -m 2 "$TARGET/api/info/login" >/dev/null && break; sleep 2; done
+          scripts/apply-pi-config.sh --target "$TARGET" --file examples/config-export.example.json --apply --no-gravity
+          for _ in $(seq 15); do curl -fs -m 2 "$TARGET/api/info/login" >/dev/null && break; sleep 2; done
+
+      - name: Applying again changes nothing
+        run: |
+          scripts/apply-pi-config.sh --target "$TARGET" --file examples/config-export.example.json | tee out.txt
+          grep -q 'Nothing to change' out.txt
+
+      - name: Round trip (export, then compare with the example)
+        run: |
+          scripts/export-pi-config.sh
+          f=local/pi/config-export.json
+          # Everything in the example must be in the export (the export has more: defaults, IDs, dates).
+          jq -e --slurpfile want examples/config-export.example.json '
+            . as $have | $want[0] as $w
+            | ($w.dns | to_entries | all(. as $e | $have.dns[$e.key] == $e.value))
+              and ($w.groups  | all(.name    as $n | any($have.groups[];  .name == $n)))
+              and ($w.lists   | all(.address as $a | any($have.lists[];   .address == $a)))
+              and ($w.domains | all(.domain  as $d | any($have.domains[]; .domain == $d)))
+              and ($w.clients | all(.client  as $c | any($have.clients[]; .client == $c)))' "$f"
+          scripts/apply-pi-config.sh --target "$TARGET" --file "$f" | grep -q 'Nothing to change'
+
+      - name: Local records resolve on the primary
+        run: docker exec primary dig +short @127.0.0.1 photos.home | grep -qx 192.168.1.10
+
+      - name: Logs on failure
+        if: failure()
+        run: |
+          docker compose logs --tail 100
+          docker logs --tail 100 primary

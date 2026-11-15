@@ -1,0 +1,84 @@
+{
+  "clients": [
+    {
+      "client": "192.168.1.50",
+      "comment": "Smart TV",
+      "groups": [0, 1],
+      "id": 1
+    }
+  ],
+  "dns": {
+    "bogusPriv": true,
+    "cnameRecords": [
+      "photos.home,nas",
+      "wiki.home,nas"
+    ],
+    "domainNeeded": false,
+    "expandHosts": false,
+    "hosts": [
+      "192.168.1.10 nas",
+      "192.168.1.11 printer"
+    ],
+    "queryLogging": false,
+    "upstreams": [
+      "127.0.0.1#5335"
+    ]
+  },
+  "domains": [
+    {
+      "comment": "Breaks the bank's login page",
+      "domain": "cdn.example.com",
+      "enabled": true,
+      "groups": [0],
+      "id": 1,
+      "kind": "exact",
+      "type": "allow"
+    },
+    {
+      "comment": "TV telemetry",
+      "domain": "(^|\\.)telemetry\\.example\\.net$",
+      "enabled": true,
+      "groups": [1],
+      "id": 2,
+      "kind": "regex",
+      "type": "deny"
+    }
+  ],
+  "groups": [
+    {
+      "comment": "The default group",
+      "enabled": true,
+      "id": 0,
+      "name": "Default"
+    },
+    {
+      "comment": "Devices that get extra blocking",
+      "enabled": true,
+      "id": 1,
+      "name": "IoT"
+    }
+  ],
+  "lists": [
+    {
+      "address": "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
+      "comment": "StevenBlack unified hosts",
+      "enabled": true,
+      "groups": [0],
+      "id": 1,
+      "type": "block"
+    },
+    {
+      "address": "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/adblock/pro.txt",
+      "comment": "HaGeZi Multi PRO",
+      "enabled": true,
+      "groups": [0],
+      "id": 2,
+      "type": "block"
+    }
+  ],
+  "pihole_version": {
+    "core": "v6.5",
+    "ftl": "v6.8",
+    "web": "v6.6.1"
+  }
+}
